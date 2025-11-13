@@ -1,0 +1,26 @@
+# 1. Model Settings
+model_name: "simple_model"
+model_params:
+  # Reconstruction 모델이므로 num_classes는 제거하고, 필요하다면 채널 수 등을 설정
+  base_channels: 32
+
+# 2. Data Settings
+# Train/Val 경로 분리
+train_dataset_path: "A:/python_code/DB/DIV2k_train"
+val_dataset_path: "A:/python_code/DB/Kodak"
+
+batch_size: 32
+num_workers: 4
+
+# 3. Training Settings
+epochs: 100
+base_lr: 0.001
+print_freq: 10
+
+# 4. Custom LR Scheduler
+lr_milestones: [40, 50, 55]
+lr_multipliers: [0.5, 0.1, 0.01]
+
+# 5. Save Settings
+save_dir: "./checkpoints"
+log_dir: "./logs"
