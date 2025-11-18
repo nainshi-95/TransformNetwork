@@ -1,214 +1,60 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Laplace
-
-class CausalConv1d(nn.Module):
-    """
-    1D Causal Convolution: i번째 출력이 [0...i] 번째 입력에만 의존
-    """
-    def __init__(self, in_channels, out_channels, kernel_size):
+class HierarchicalEntropyModel(nn.Module):
+    def __init__(self):
         super().__init__()
-        # (kernel_size - 1) 만큼 왼쪽에 패딩을 추가
-        self.pad = nn.ConstantPad1d((kernel_size - 1, 0), 0)
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size)
+        # Context를 받아서 4개의 파라미터 예측
+        # 1. p_nonzero (0이 아닐 확률)
+        # 2. p_pos (양수일 확률)
+        # 3. mu_log (log(|y|)의 평균)
+        # 4. sigma_log (log(|y|)의 표준편차)
+        self.net = nn.Sequential(..., nn.Linear(ctx_dim, 4))
 
-    def forward(self, x):
-        # x: (B, C_in, 64)
-        x = self.pad(x)
-        x = self.conv(x)
-        # x: (B, C_out, 64)
-        return x
-
-class ZigZagACModel(nn.Module):
-    """
-    AC 계수(i=1..63)를 위한 4-Head Autoregressive 모델
-    (DC 계수 i=0은 DPCM으로 별도 처리해야 함)
-    """
-    def __init__(self, in_channels=1, embed_dim=128):
-        super().__init__()
+    def forward(self, y_true, context):
+        # y_true: 실제 양자화된 DCT 계수 (예: -500, 0, 3, ...)
         
-        # 입력(quantized AC)을 embedding 층으로 보낼 수 있습니다.
-        # 여기서는 간단히 1채널 Conv로 대체합니다.
-        self.input_layer = CausalConv1d(in_channels, embed_dim, kernel_size=5)
+        # 네트워크 출력 예측
+        preds = self.net(context)
+        p_nonzero = torch.sigmoid(preds[:, 0])
+        p_pos = torch.sigmoid(preds[:, 1])
+        mu_log = preds[:, 2]
+        sigma_log = F.softplus(preds[:, 3]) + 1e-6
+
+        # --- 확률 계산 (비트 계산) ---
         
-        self.backbone = nn.Sequential(
-            nn.ReLU(),
-            CausalConv1d(embed_dim, embed_dim, kernel_size=5),
-            nn.ReLU(),
-            CausalConv1d(embed_dim, embed_dim, kernel_size=5),
-            nn.ReLU()
-        )
+        # 1. Zero/Non-zero 확률
+        is_zero = (torch.abs(y_true) < 0.5).float()
+        # 0일 때 확률: (1 - p_nonzero)
+        # 0 아닐 때 확률: p_nonzero
+        prob_step1 = is_zero * (1 - p_nonzero) + (1 - is_zero) * p_nonzero
+
+        # 2. Sign 확률 (0이 아닐 때만 적용)
+        is_pos = (y_true > 0).float()
+        prob_step2 = is_pos * p_pos + (1 - is_pos) * (1 - p_pos)
+        # 0일 때는 부호 확률이 필요 없으므로 1로 처리 (log(1)=0 비트 소모 없음)
+        prob_step2 = is_zero * 1.0 + (1 - is_zero) * prob_step2
+
+        # 3. Magnitude 확률 (로그 스케일 분포)
+        # y가 0이 아닐 때, |y|가 나올 확률
+        # 우리는 log(|y|)가 가우시안을 따른다고 가정 (Log-Normal 분포 유사)
+        abs_y = torch.abs(y_true)
         
-        # 4개의 독립적인 예측 헤드
+        # 적분 구간: log(|y| - 0.5) ~ log(|y| + 0.5)
+        # 큰 값일수록 구간이 로그 스케일이라 좁아지지만, 분포도 같이 넓어짐
+        # 0인 경우 계산 에러 방지를 위해 clamp
+        safe_abs = torch.clamp(abs_y, min=0.5) 
         
-        # 1. EOB 헤드 (마지막 0이 아닌 값인가?)
-        self.head_last = nn.Conv1d(embed_dim, 1, kernel_size=1)
+        dist = torch.distributions.Normal(mu_log, sigma_log)
+        cdf_upper = dist.cdf(torch.log(safe_abs + 0.5))
+        cdf_lower = dist.cdf(torch.log(safe_abs - 0.5))
         
-        # 2. Significance 헤드 (0인가 0이 아닌가?)
-        self.head_sig = nn.Conv1d(embed_dim, 1, kernel_size=1)
+        prob_magnitude = cdf_upper - cdf_lower
         
-        # 3. Sign 헤드 (0이 아닐 경우, 부호는 +인가 -인가?)
-        self.head_sign = nn.Conv1d(embed_dim, 1, kernel_size=1)
+        # 마찬가지로 0일 때는 크기 확률 필요 없음
+        prob_step3 = is_zero * 1.0 + (1 - is_zero) * prob_magnitude
+
+        # 4. 최종 확률 결합
+        total_prob = prob_step1 * prob_step2 * prob_step3
         
-        # 4. Magnitude 헤드 (0이 아닐 경우, 크기 |k|-1은 얼마인가?)
-        # (라플라스의 log_scale 예측)
-        self.head_mag_log_scale = nn.Conv1d(embed_dim, 1, kernel_size=1)
-
-    def forward(self, x_flat_ac):
-        # x_flat_ac: (B, 1, 63) - 지그재그 스캔된 AC 계수 시퀀스
+        # 비트 폭발 방지 (Clamp)
+        total_prob = torch.clamp(total_prob, min=1e-9)
         
-        # Causal Conv를 통과한 특징 맵
-        # features: (B, embed_dim, 63)
-        features = self.input_layer(x_flat_ac)
-        features = self.backbone(features)
-        
-        # 4개 헤드 예측 (병렬 수행)
-        last_logits = self.head_last(features)         # (B, 1, 63)
-        sig_logits = self.head_sig(features)          # (B, 1, 63)
-        sign_logits = self.head_sign(features)        # (B, 1, 63)
-        mag_log_scale = self.head_mag_log_scale(features) # (B, 1, 63)
-        
-        preds = {
-            "last_logits": last_logits,
-            "sig_logits": sig_logits,
-            "sign_logits": sign_logits,
-            "mag_log_scale": mag_log_scale
-        }
-        return preds
-
-
-
-
-def prepare_eob_targets(y_flat_ac):
-    """손실 계산에 필요한 정답(Ground Truth) 3종 세트 준비"""
-    # y_flat_ac: (B, 1, 63) - 정답 AC 계수 (지그재그 정렬)
-    
-    B, _, N = y_flat_ac.shape
-    y_flat = y_flat_ac.view(B, N) # (B, 63)
-
-    # 1. Significance Target (0인가 아닌가)
-    y_sig = (y_flat != 0).float() # (B, 63)
-
-    # 2. Last Index Target (0이 아닌 마지막 위치 찾기)
-    y_last_idx = torch.full((B,), -1, dtype=torch.long, device=y_flat.device)
-    for b in range(B):
-        nonzero_indices = torch.where(y_sig[b] > 0)[0]
-        if len(nonzero_indices) > 0:
-            y_last_idx[b] = nonzero_indices.max()
-
-    # 3. Last Flag Target (One-hot)
-    y_last = F.one_hot(y_last_idx.clamp(min=0), num_classes=N).float() # (B, 63)
-    # 모두 0인 블록(-1)은 (0,0,...,0)이 됨 (y_last_idx[b] >= 0 일 때만 1을 할당)
-    y_last[y_last_idx < 0] = 0.0
-
-    targets = {
-        "y_flat_q": y_flat,   # (B, 63)
-        "y_sig": y_sig,       # (B, 63)
-        "y_last": y_last,     # (B, 63)
-        "y_last_idx": y_last_idx # (B,)
-    }
-    return targets
-
-def calculate_value_nll(val_preds, y_flat_q, nonzero_mask):
-    """0이 아닌 값들(부호 + 크기)의 NLL(Nats) 계산"""
-    sign_logits, mag_log_scale = val_preds
-    
-    if nonzero_mask.sum() == 0:
-        return torch.tensor(0.0, device=y_flat_q.device)
-
-    B, N = y_flat_q.shape
-    
-    # --- 3a. 부호(Sign) 비트레이트 ---
-    targets_sign = (y_flat_q[nonzero_mask] > 0).float()
-    preds_sign = sign_logits.view(B, N)[nonzero_mask]
-    bits_sign_nats = F.binary_cross_entropy_with_logits(
-        preds_sign, targets_sign, reduction='sum'
-    )
-
-    # --- 3b. 크기(Magnitude) 비트레이트 (|k|-1) ---
-    targets_mag_prime = (y_flat_q.abs() - 1)[nonzero_mask].float()
-    
-    preds_log_scale = mag_log_scale.view(B, N)[nonzero_mask]
-    preds_scale = torch.exp(preds_log_scale).clamp(min=1e-6)
-    
-    lap_dist = Laplace(torch.tensor(0.0, device=preds_scale.device), preds_scale)
-    
-    cdf_upper = lap_dist.cdf(targets_mag_prime + 0.5)
-    cdf_lower = lap_dist.cdf(targets_mag_prime - 0.5)
-    
-    prob_k_prime = (cdf_upper - cdf_lower).clamp(min=1e-9)
-    log_prob_k_prime = torch.log(prob_k_prime)
-    
-    bits_mag_nats = -torch.sum(log_prob_k_prime)
-    
-    return bits_sign_nats + bits_mag_nats
-
-def get_eob_bitrate_loss(preds, targets):
-    """
-    4-Head 모델의 전체 비트레이트 손실(bpp) 계산
-    """
-    # 예측값 및 정답 타겟
-    last_logits = preds["last_logits"]
-    sig_logits = preds["sig_logits"]
-    val_preds = (preds["sign_logits"], preds["mag_log_scale"])
-    
-    y_flat_q = targets["y_flat_q"]
-    y_sig = targets["y_sig"]
-    y_last = targets["y_last"]
-    y_last_idx = targets["y_last_idx"]
-    
-    B, N = y_flat_q.shape
-    num_elements = B * N # B * 63
-
-    # --- 1. Active Mask (EOB 시뮬레이션) ---
-    indices = torch.arange(N, device=y_flat_q.device).unsqueeze(0).expand(B, -1)
-    # 마지막 인덱스(포함)까지만 1, 그 이후는 0
-    active_mask = (indices <= y_last_idx.unsqueeze(1)).float()
-
-    # --- 2. EOB (Last) 비트레이트 ---
-    # (B, 1, 63) -> (B, 63)
-    bits_last_nats = F.binary_cross_entropy_with_logits(
-        last_logits.view(B, N), y_last, reduction='none'
-    )
-    # EOB 신호는 active_mask가 1인 곳까지만 물어본다.
-    bits_last = (bits_last_nats * active_mask).sum()
-
-    # --- 3. Significance (0/1) 비트레이트 ---
-    bits_sig_nats = F.binary_cross_entropy_with_logits(
-        sig_logits.view(B, N), y_sig, reduction='none'
-    )
-    # Sig 신호는 EOB(active)가 1이고, 'last'가 아닌(1-y_last) 곳에서만 물어본다.
-    sig_mask = active_mask * (1 - y_last)
-    bits_sig = (bits_sig_nats * sig_mask).sum()
-
-    # --- 4. Value (Sign + Mag) 비트레이트 ---
-    # 0이 아닌 위치(y_sig=1)에서만 계산
-    # (y_sig=1 이면 sig_mask=1, active_mask=1이 보장됨)
-    nonzero_mask = (y_sig > 0)
-    bits_val = calculate_value_nll(val_preds, y_flat_q, nonzero_mask)
-
-    # --- 5. Total BPP ---
-    total_nats = bits_last + bits_sig + bits_val
-    
-    # 8x8=64 픽셀당 bpp로 환산
-    total_pixels_in_batch = B * 64 
-    bpp_loss = total_nats / (total_pixels_in_batch * torch.log(torch.tensor(2.0)))
-    
-    return bpp_loss
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        return total_prob
