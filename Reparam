@@ -1,0 +1,190 @@
+
+class Conv2d(nn.Module):
+    def __init__(self, in_ch, out_ch, cutting_in_ch, cutting_out_ch, kernel_size, stride, padding):
+        super(Conv2d, self).__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.cutting_in_ch = cutting_in_ch
+        self.cutting_out_ch = cutting_out_ch
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.updated = False
+        
+        self.weight = nn.Parameter(torch.Tensor(out_ch, in_ch, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.Tensor(out_ch))
+        
+        if (self.in_ch != self.out_ch) or (self.stride != 1):
+            self.main_skip_w = nn.Parameter(torch.Tensor(out_ch, in_ch, 1, 1))
+            self.main_skip_b = nn.Parameter(torch.Tensor(out_ch))
+        
+        if self.in_ch != self.cutting_in_ch:
+            self.cutting_in_w = nn.Parameter(torch.Tensor(in_ch, cutting_in_ch, 1, 1))
+            self.cutting_in_b = nn.Parameter(torch.Tensor(in_ch))
+        
+        if self.out_ch != self.cutting_out_ch:
+            self.cutting_out_w = nn.Parameter(torch.Tensor(cutting_out_ch, out_ch, 1, 1))
+            self.cutting_out_b = nn.Parameter(torch.Tensor(cutting_out_ch))
+        
+        if (self.cutting_in_ch != self.cutting_out_ch) or (self.stride != 1):
+            self.cutting_skip_w = nn.Parameter(torch.Tensor(cutting_out_ch, cutting_in_ch, 1, 1))
+            self.cutting_skip_b = nn.Parameter(torch.Tensor(cutting_out_ch))
+        
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            if fan_in != 0:
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(self.bias, -bound, bound)
+        
+        if (self.in_ch != self.out_ch) or (self.stride != 1):
+            nn.init.kaiming_uniform_(self.main_skip_w, a=math.sqrt(5))
+            if self.main_skip_b is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.main_skip_w)
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.main_skip_b, -bound, bound)
+        
+        if self.in_ch != self.cutting_in_ch:
+            nn.init.kaiming_uniform_(self.cutting_in_w, a=math.sqrt(5))
+            if self.cutting_in_b is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.cutting_in_w)
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.cutting_in_b, -bound, bound)
+        
+        if self.out_ch != self.cutting_out_ch:
+            nn.init.kaiming_uniform_(self.cutting_out_w, a=math.sqrt(5))
+            if self.cutting_out_b is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.cutting_out_w)
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.cutting_out_b, -bound, bound)
+        
+        if (self.cutting_in_ch != self.cutting_out_ch) or (self.stride != 1):
+            nn.init.kaiming_uniform_(self.cutting_skip_w, a=math.sqrt(5))
+            if self.cutting_skip_b is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.cutting_skip_w)
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.cutting_skip_b, -bound, bound)
+    
+    def identity_sc(self, w):
+        o_ch, i_ch, k, k = w.size()
+        assert o_ch == i_ch, 'Identity skip connection must have same in_ch and out_ch'
+        
+        if k % 2 == 0:
+            target_idx = k // 2 - 1
+        else:
+            target_idx = k // 2
+        
+        for i in range(o_ch):
+            w[i, i, target_idx, target_idx] += 1.0
+        return w
+    
+    def conv_sc(self, w, b, w_sc, b_sc):
+        # combine two convolutions for skip connection
+        o_ch, i_ch, k, k = w.size()
+        
+        if k % 2 == 0:
+            target_idx = k // 2 - 1
+        else:
+            target_idx = k // 2
+        
+        w[:, :, target_idx, target_idx] += w_sc[:, :, 0, 0]
+        b += b_sc
+        return w, b
+    
+    def joint_conv(self, w, b, w_a, b_a, front_to_back=True):
+        if front_to_back:   # conv_1x1 ---- conv_main
+            o_ch, i_ch, k, k = w.size()
+            w_out = F.conv2d(input=w, weight=w_a.permute(1, 0, 2, 3), stride=1, padding=0)
+            b_out = F.conv2d(input=b_a.view(1, -1, 1, 1) * torch.ones(1, i_ch, k, k, device=b_a.device, dtype=b_a.dtype), weight=w, bias=b, stride=1, padding=0).view(-1)
+        else:   # conv_main ---- conv_1x1
+            w_out = F.conv2d(input=w.permute(1, 0, 2, 3), weight=w_a, stride=1, padding=0).permute(1, 0, 2, 3)
+            b_out = F.conv2d(input=b.view(1, -1, 1, 1), weight=w_a, bias=b_a, stride=1, padding=0).view(-1)
+        return w_out, b_out
+        
+    def update(self):
+        weight = self.weight.data
+        bias = self.bias.data
+        
+        if (self.in_ch != self.out_ch) or (self.stride != 1):
+            # convolutional skip connection
+            weight, bias = self.conv_sc(weight, bias, self.main_skip_w.data, self.main_skip_b.data)
+        else:  # identity skip connection
+            weight = self.identity_sc(weight)
+        
+        if self.in_ch != self.cutting_in_ch:
+            weight, bias = self.joint_conv(weight, bias, self.cutting_in_w.data, self.cutting_in_b.data, front_to_back=True)
+        if self.out_ch != self.cutting_out_ch:
+            weight, bias = self.joint_conv(weight, bias, self.cutting_out_w.data, self.cutting_out_b.data, front_to_back=False)
+        
+        if (self.cutting_in_ch != self.cutting_out_ch) or (self.stride != 1):
+            weight, bias = self.conv_sc(weight, bias, self.cutting_skip_w.data, self.cutting_skip_b.data)
+        else:
+            weight = self.identity_sc(weight)
+        
+        delattr(self, 'weight')
+        delattr(self, 'bias')
+        
+        self.register_parameter('weight', nn.Parameter(weight))
+        self.register_parameter('bias', nn.Parameter(bias))
+        self.updated = True
+        
+        if (self.in_ch != self.out_ch) or (self.stride != 1):
+            delattr(self, 'main_skip_w')
+            delattr(self, 'main_skip_b')
+        if self.in_ch != self.cutting_in_ch:
+            delattr(self, 'cutting_in_w')
+            delattr(self, 'cutting_in_b')
+        if self.out_ch != self.cutting_out_ch:
+            delattr(self, 'cutting_out_w')
+            delattr(self, 'cutting_out_b')
+        if (self.cutting_in_ch != self.cutting_out_ch) or (self.stride != 1):
+            delattr(self, 'cutting_skip_w')
+            delattr(self, 'cutting_skip_b')
+    
+    def forward(self, x):
+        if self.updated:
+            out = F.conv2d(x, self.weight, self.bias, self.stride, self.padding)
+        else:
+            if (self.cutting_in_ch != self.cutting_out_ch) or (self.stride != 1):
+                sc_cutting = F.conv2d(x, self.cutting_skip_w, self.cutting_skip_b, self.stride, 0)
+            else:
+                sc_cutting = x
+            
+            # cutting_in_ch to in_ch
+            if self.in_ch != self.cutting_in_ch:
+                x = F.conv2d(x, self.cutting_in_w, None, 1, 0)
+            
+            if (self.in_ch != self.out_ch) or (self.stride != 1):
+                if self.in_ch != self.cutting_in_ch:
+                    sc_main = F.conv2d(x + self.cutting_in_b.view(1, -1, 1, 1), self.main_skip_w, self.main_skip_b, self.stride, 0)
+                else:
+                    sc_main = F.conv2d(x, self.main_skip_w, self.main_skip_b, self.stride, 0)
+            else:
+                if self.in_ch != self.cutting_in_ch:
+                    sc_main = x + self.cutting_in_b.view(1, -1, 1, 1)
+                else:
+                    sc_main = x
+            
+            # main conv
+            if self.in_ch != self.cutting_in_ch:
+                x = F.pad(x, (self.padding, self.padding, self.padding, self.padding), 'constant', 0) + self.cutting_in_b.view(1, -1, 1, 1)
+            else:
+                x = F.pad(x, (self.padding, self.padding, self.padding, self.padding), 'constant', 0)
+            x = F.conv2d(x, self.weight, self.bias, self.stride, 0)
+            
+            x = x + sc_main
+            
+            # out_ch to cutting_out_ch
+            if self.out_ch != self.cutting_out_ch:
+                x = F.conv2d(x, self.cutting_out_w, self.cutting_out_b, 1, 0)
+            
+            out = x + sc_cutting
+        return out
+
