@@ -1,0 +1,88 @@
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+
+# ==========================================
+# 1. 데이터 준비 (예시용 더미 데이터)
+# 실제 사용 시에는 준비하신 데이터를 불러오세요.
+# ==========================================
+# 인풋: 7개 정수 (-10 ~ 10)
+X = np.random.randint(-10, 11, size=(100000, 7))
+# 아웃풋: 64개 클래스 (0 ~ 63)
+y = np.random.randint(0, 64, size=(100000))
+
+# ==========================================
+# 2. Feature Engineering (핵심: 힌트 주기)
+# ==========================================
+def add_features(X_input):
+    # 원본 7개 복사
+    features = [X_input]
+    
+    # 인접한 두 수의 차이 추가 (x1-x2, x2-x3 ...) -> 6개 추가
+    diffs = X_input[:, :-1] - X_input[:, 1:]
+    features.append(diffs)
+    
+    # (선택사항) 첫번째 값과 나머지 값들의 차이 등 추가 가능
+    # center_diffs = X_input[:, 1:] - X_input[:, 0:1]
+    # features.append(center_diffs)
+    
+    return np.hstack(features)
+
+# 입력 데이터 확장 (7개 -> 13개로 증가)
+X_extended = add_features(X)
+
+# 학습/검증 데이터 분리
+X_train, X_test, y_train, y_test = train_test_split(X_extended, y, test_size=0.2, random_state=42)
+
+# ==========================================
+# 3. 모델 학습 (메모리 제약 설정)
+# ==========================================
+# max_leaf_nodes: 이 값이 바로 LUT의 크기(행 개수)가 됩니다.
+# 4096개면 충분히 작으면서도 강력합니다.
+model = DecisionTreeClassifier(
+    max_leaf_nodes=4096,    # 리프 노드 최대 개수 제한 (LUT 용량 조절)
+    max_depth=15,           # 너무 깊어지지 않게 제한 (검색 속도 조절)
+    criterion='gini',       # 불순도 계산 기준
+    random_state=42
+)
+
+print("학습 시작...")
+model.fit(X_train, y_train)
+print(f"학습 완료! 실제 리프 노드 개수: {model.get_n_leaves()}")
+print(f"테스트 셋 정확도: {model.score(X_test, y_test):.4f}")
+
+# ==========================================
+# 4. LUT (Look-Up Table) 추출
+# 이것이 실제 임베디드/압축기에 들어갈 데이터입니다.
+# ==========================================
+tree = model.tree_
+
+# tree.value: [노드 개수, 1, 클래스 개수] 형태의 배열
+# 각 리프 노드에 도달한 샘플들이 클래스별로 몇 개인지 카운트가 들어있음
+node_counts = tree.value[:, 0, :]  # shape: (전체 노드 수, 64)
+
+# 카운트를 확률로 변환 (Softmax 대신 단순 비율 계산)
+# 0으로 나누는 것 방지를 위해 아주 작은 수(epsilon) 추가
+epsilon = 1e-9
+prob_lut = node_counts / (node_counts.sum(axis=1, keepdims=True) + epsilon)
+
+# children_left/right: 트리 구조 (이동 경로)
+# -1이면 리프 노드라는 뜻
+children_left = tree.children_left
+children_right = tree.children_right
+feature_idx = tree.feature
+threshold = tree.threshold
+
+print("\n--- LUT 추출 예시 (C언어 변환용) ---")
+print(f"LUT 크기: {prob_lut.shape} (노드 개수 x 클래스 64개)")
+
+# 예: 10번 노드의 정보 확인
+node_id = 10
+if children_left[node_id] == -1:
+    print(f"노드 {node_id}는 리프 노드입니다.")
+    print(f"이 노드의 클래스별 확률(상위 5개): {prob_lut[node_id][:5]}...")
+    best_class = np.argmax(prob_lut[node_id])
+    print(f"가장 확률 높은 클래스: {best_class}")
+else:
+    print(f"노드 {node_id}는 분기 노드입니다.")
+    print(f"조건: 입력[{feature_idx[node_id]}] <= {threshold[node_id]}")
