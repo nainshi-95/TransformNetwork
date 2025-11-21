@@ -1,0 +1,96 @@
+from sklearn.tree import export_text, plot_tree
+import matplotlib.pyplot as plt
+
+# 앞선 코드에서 학습된 'model'이 있다고 가정합니다.
+
+# (1) Feature 이름 정의 (보기 편하게)
+# 예: x0~x6 (원본), d0~d5 (차분)
+feature_names = [f"x{i}" for i in range(7)] + [f"diff_{i}_{i+1}" for i in range(6)]
+
+# (2) 텍스트로 if-else 구조 출력
+# 전체를 다 찍으면 너무 기니까 깊이(depth)를 3까지만 찍어봅니다.
+print("--- 텍스트 트리 구조 (상위 3단계만) ---")
+tree_rules = export_text(model, feature_names=feature_names, max_depth=3)
+print(tree_rules)
+
+# (3) 이미지로 그리기
+# 이것도 너무 크면 안 보이니 깊이를 제한해서 그립니다.
+plt.figure(figsize=(20, 10))
+plot_tree(model, feature_names=feature_names, max_depth=3, filled=True, fontsize=10)
+plt.show()
+
+
+
+
+
+from sklearn.tree import _tree
+
+def tree_to_code(tree_model, feature_names):
+    tree_ = tree_model.tree_
+    feature_name = [
+        feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
+        for i in tree_.feature
+    ]
+    
+    print(f"def predict_tree(input_data):")
+    
+    def recurse(node, depth):
+        indent = "    " * depth
+        
+        # 리프 노드인 경우 (분기가 끝남)
+        if tree_.feature[node] != _tree.TREE_UNDEFINED:
+            name = feature_name[node]
+            threshold = tree_.threshold[node]
+            
+            # if 문 출력
+            print(f"{indent}if input_data['{name}'] <= {threshold:.2f}:")
+            recurse(tree_.children_left[node], depth + 1)
+            
+            # else 문 출력
+            print(f"{indent}else:  # if input_data['{name}'] > {threshold:.2f}")
+            recurse(tree_.children_right[node], depth + 1)
+            
+        else:
+            # 리프 노드 도달: 여기서 LUT 인덱스를 반환하거나 클래스를 반환
+            # 확률 분포는 tree_.value[node]에 들어있습니다.
+            # 여기서는 가장 확률 높은 클래스를 반환하도록 찍어봅니다.
+            class_counts = tree_.value[node][0]
+            predicted_class = np.argmax(class_counts)
+            node_id = node # LUT 인덱스로 사용할 노드 ID
+            print(f"{indent}return {predicted_class} (Node ID: {node_id})")
+
+    # 재귀 함수 시작
+    recurse(0, 1)
+
+# === 사용 예시 ===
+# feature_names는 위에서 정의한 리스트 사용
+print("--- 생성된 if-else 코드 ---")
+tree_to_code(model, feature_names)
+
+
+
+
+def predict_tree(input_data):
+    if input_data['diff_0_1'] <= 1.50:
+        if input_data['x3'] <= -2.50:
+            if input_data['diff_2_3'] <= 0.50:
+                return 12 (Node ID: 5)
+            else:
+                return 4 (Node ID: 6)
+        else:
+            # ...
+    else:  # if input_data['diff_0_1'] > 1.50
+        if input_data['x5'] <= 5.50:
+            return 63 (Node ID: 20)
+        else:
+            return 0 (Node ID: 21)
+
+
+
+
+
+
+
+
+
+
