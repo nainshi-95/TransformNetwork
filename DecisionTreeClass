@@ -14,6 +14,44 @@ y = np.random.randint(0, 64, size=(100000))
 # ==========================================
 # 2. Feature Engineering (핵심: 힌트 주기)
 # ==========================================
+
+
+
+import torch
+import itertools
+
+def add_features(x):
+    """
+    x: (Batch_Size, 7) 형태의 텐서라고 가정
+    """
+    # 피처들을 담을 리스트 (원본 x 포함)
+    features_list = [x]
+    
+    # 1. 7개 인풋에 대한 모든 조합의 차분값 (x_i - x_j)
+    # itertools.combinations를 사용하여 중복 없이 2개씩 짝지음 (7C2 = 21개)
+    num_inputs = x.shape[1] # 7
+    for i, j in itertools.combinations(range(num_inputs), 2):
+        diff = x[:, i] - x[:, j]
+        features_list.append(diff.unsqueeze(1)) # 차원 유지를 위해 unsqueeze
+        
+    # 2. 인풋 2, 3, 4, 5번의 평균과 표준편차
+    # 슬라이싱 x[:, 2:6] -> 인덱스 2, 3, 4, 5 포함
+    subset = x[:, 2:6]
+    
+    subset_mean = torch.mean(subset, dim=1, keepdim=True)
+    subset_std = torch.std(subset, dim=1, keepdim=True)
+    
+    features_list.append(subset_mean)
+    features_list.append(subset_std)
+    
+    # 모든 피처를 가로 방향(dim=1)으로 합침
+    return torch.cat(features_list, dim=1)
+
+
+
+
+
+
 def add_features(X_input):
     # 원본 7개 복사
     features = [X_input]
